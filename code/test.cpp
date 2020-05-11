@@ -3,11 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 #include <time.h>
 
 #include "knncuda.h"
 
+#include "nanoflann.hpp"
 
 /**
  * Initializes randomly the reference and query points.
@@ -175,6 +175,94 @@ bool knn_c(const float * ref,
 }
 
 
+enum { DIM = 16 };
+
+using namespace nanoflann;
+
+class PointsProvider
+{
+public:
+    PointsProvider(const float * ref,
+        int           ref_nb)
+        : ref_(ref), ref_nb_(ref_nb)
+    {}
+
+    size_t kdtree_get_point_count() const
+    {
+        return ref_nb_;
+    }
+
+    // Returns the dim'th component of the idx'th point in the class:
+    // Since this is inlined and the "dim" argument is typically an immediate value, the
+    //  "if/else's" are actually solved at compile time.
+    float kdtree_get_pt(const size_t idx, const size_t dim) const
+    {
+        return ref_[ref_nb_ * dim + idx];
+    }
+
+    // Optional bounding-box computation: return false to default to a standard bbox computation loop.
+    //   Return true if the BBOX was already computed by the class and returned in "bb" so it can be avoided to redo it again.
+    //   Look at bb.size() to find out the expected dimensionality (e.g. 2 or 3 for point clouds)
+    template <class BBOX>
+    bool kdtree_get_bbox(BBOX& /* bb */) const { return false; }
+
+
+private:
+    const float * ref_;
+    int           ref_nb_;
+};
+
+
+
+// construct a kd-tree index:
+typedef KDTreeSingleIndexAdaptor<
+    L2_Simple_Adaptor<float, PointsProvider >,
+    PointsProvider,
+    DIM /* dim */
+> my_kd_tree_t;
+
+
+bool knn_nanoflann(const float * ref,
+    int           ref_nb,
+    const float * query,
+    int           query_nb,
+    int           dim,
+    int           k,
+    float *       knn_dist,
+    int *         knn_index) {
+
+    PointsProvider provider(ref, ref_nb);
+
+    my_kd_tree_t infos(DIM, provider);
+
+    infos.buildIndex();
+
+    std::vector<size_t> index(k);
+    std::vector<float> dist(k);
+
+    for (int i = 0; i < query_nb; ++i)
+    {
+
+        float pos[DIM];
+
+        for (int d = 0; d < DIM; ++d) {
+            pos[d] = query[d * query_nb + i];
+        }
+
+        infos.knnSearch(&pos[0], k, &index[0], &dist[0]);
+
+        // Copy k smallest distances and their associated index
+        for (int j = 0; j < k; ++j) {
+            knn_dist[j * query_nb + i] = sqrtf(dist[j]);
+            knn_index[j * query_nb + i] = index[j];
+        }
+
+    }
+
+    return true;
+}
+
+
 /**
  * Test an input k-NN function implementation by verifying that its output
  * results (distances and corresponding indexes) are similar to the expected
@@ -213,8 +301,10 @@ bool test(const float * ref,
           int           nb_iterations) {
 
     // Parameters
-    const float precision    = 0.001f; // distance error max
-    const float min_accuracy = 0.999f; // percentage of correct values required
+    //const float precision    = 0.001f; // distance error max
+    //const float min_accuracy = 0.999f; // percentage of correct values required
+    const float precision = 0.01f; // distance error max
+    const float min_accuracy = 0.99f; // percentage of correct values required
 
     // Display k-NN function name
     printf("- %-17s : ", name);
@@ -232,8 +322,7 @@ bool test(const float * ref,
     }
 
     // Start timer
-    struct timeval tic;
-    gettimeofday(&tic, NULL);
+    clock_t tic = clock();
 
     // Compute k-NN several times
     for (int i=0; i<nb_iterations; ++i) {
@@ -245,12 +334,10 @@ bool test(const float * ref,
     }
 
     // Stop timer
-    struct timeval toc;
-    gettimeofday(&toc, NULL);
+    clock_t toc = clock();
 
     // Elapsed time in ms
-    double elapsed_time = toc.tv_sec - tic.tv_sec;
-    elapsed_time += (toc.tv_usec - tic.tv_usec) / 1000000.;
+    double elapsed_time = ((double)toc - tic) / CLOCKS_PER_SEC;
 
     // Verify both precisions and indexes of the k-NN values
     int nb_correct_precisions = 0;
@@ -292,9 +379,9 @@ bool test(const float * ref,
 int main(void) {
 
     // Parameters
-    const int ref_nb   = 16384;
+    const int ref_nb   = 16384 * 8;
     const int query_nb = 4096;
-    const int dim      = 128;
+    const int dim      = DIM;
     const int k        = 16;
 
     // Display
@@ -341,6 +428,7 @@ int main(void) {
 
     // Test all k-NN functions
     printf("TESTS\n");
+    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_nanoflann,    "knn_nanoflann",      2);
     test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_c,            "knn_c",              2);
     test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_global,  "knn_cuda_global",  100); 
     test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_texture, "knn_cuda_texture", 100); 
